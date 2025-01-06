@@ -1,7 +1,10 @@
 package jwt
 
 import (
+	"crypto"
 	"crypto/hmac"
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
@@ -28,6 +31,7 @@ const (
 	stdHeaderAlg  = "alg"
 	stdHeaderType = "typ"
 	stdAlgHS256   = "HS256"
+	stdAlgRS256   = "RS256"
 	stdTypeJWT    = "JWT"
 	stdClaimAud   = "aud"
 	stdClaimIss   = "iss"
@@ -39,9 +43,18 @@ const (
 )
 
 func SignHMAC(secret string, options ...func(*JWTOptions)) (string, error) {
+	headersStr, claimsStr, err := processOptions(stdAlgHS256, options)
+	if err != nil {
+		return "", err
+	}
+	signature := signHMAC(secret, fmt.Sprintf("%s.%s", headersStr, claimsStr))
+	return fmt.Sprintf("%s.%s.%s", headersStr, claimsStr, signature), nil
+}
+
+func processOptions(alg string, options []func(*JWTOptions)) (string, string, error) {
 	opts := &JWTOptions{
 		Headers: map[string]any{
-			stdHeaderAlg:  stdAlgHS256,
+			stdHeaderAlg:  alg,
 			stdHeaderType: stdTypeJWT,
 		},
 		Claims: map[string]any{},
@@ -51,14 +64,13 @@ func SignHMAC(secret string, options ...func(*JWTOptions)) (string, error) {
 	}
 	headersStr, err := mapToJWTSegment(opts.Headers)
 	if err != nil {
-		return "", fmt.Errorf("failed to marshal jwt headers: %w", err)
+		return "", "", fmt.Errorf("failed to marshal jwt headers: %w", err)
 	}
 	claimsStr, err := mapToJWTSegment(opts.Claims)
 	if err != nil {
-		return "", fmt.Errorf("failed to marshal jwt claims: %w", err)
+		return "", "", fmt.Errorf("failed to marshal jwt claims: %w", err)
 	}
-	signature := sign(secret, fmt.Sprintf("%s.%s", headersStr, claimsStr))
-	return fmt.Sprintf("%s.%s.%s", headersStr, claimsStr, signature), nil
+	return headersStr, claimsStr, nil
 }
 
 func mapToJWTSegment(m map[string]any) (string, error) {
@@ -69,11 +81,39 @@ func mapToJWTSegment(m map[string]any) (string, error) {
 	return base64.RawURLEncoding.EncodeToString(bytes), nil
 }
 
-func sign(secret, payload string) string {
+func signHMAC(secret, payload string) string {
 	mac := hmac.New(sha256.New, []byte(secret))
 	mac.Write([]byte(payload))
 	data := mac.Sum(nil)
 	return base64.RawURLEncoding.EncodeToString(data)
+}
+
+func SignRSA(privateKey *rsa.PrivateKey, options ...func(*JWTOptions)) (string, error) {
+	headersStr, claimsStr, err := processOptions(stdAlgRS256, options)
+	if err != nil {
+		return "", err
+	}
+	signature, err := signRSA(privateKey, fmt.Sprintf("%s.%s", headersStr, claimsStr))
+	if err != nil {
+		return "", fmt.Errorf("failed to sign jwt: %w", err)
+	}
+	return fmt.Sprintf("%s.%s.%s", headersStr, claimsStr, signature), nil
+}
+
+func signRSA(privateKey *rsa.PrivateKey, payload string) (string, error) {
+	if privateKey == nil {
+		return "", fmt.Errorf("private key cannot be nil")
+	}
+	payloadHash := sha256.New()
+	_, err := payloadHash.Write([]byte(payload))
+	if err != nil {
+		return "", err
+	}
+	signatureBytes, err := rsa.SignPKCS1v15(rand.Reader, privateKey, crypto.SHA256, payloadHash.Sum(nil))
+	if err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(signatureBytes), nil
 }
 
 func WithHeader(key string, val any) func(*JWTOptions) {
@@ -117,37 +157,32 @@ func WithJti(val string) func(*JWTOptions) {
 }
 
 func VerifyHMAC(secret, token string, validations ...func(*JWTDecoded) error) (*JWTDecoded, error) {
-	segments := strings.Split(token, ".")
-	if len(segments) != 3 {
-		return nil, fmt.Errorf("jwt was malformed, expected 3 parts, found %d", len(segments))
-	}
-	headers, err := jwtSegmentToMap(segments[0])
+	segments, headers, err := processHeaders(token)
 	if err != nil {
-		return nil, fmt.Errorf("failed to unmarshal jwt headers: %w", err)
-	}
-	if headers[stdHeaderType] != stdTypeJWT {
-		return nil, fmt.Errorf("jwt type of '%s' is not supported", headers["typ"])
+		return nil, err
 	}
 	if headers[stdHeaderAlg] != stdAlgHS256 {
 		return nil, fmt.Errorf("jwt signature alg of '%s' is not supported", headers["alg"])
 	}
-	if err := verify(secret, fmt.Sprintf("%s.%s", segments[0], segments[1]), segments[2]); err != nil {
+	if err := verifyHMACSignature(secret, fmt.Sprintf("%s.%s", segments[0], segments[1]), segments[2]); err != nil {
 		return nil, fmt.Errorf("jwt signature validation failed: %w", err)
 	}
-	claims, err := jwtSegmentToMap(segments[1])
+	return processClaimsAndValidations(segments[1], headers, validations)
+}
+
+func processHeaders(token string) ([]string, map[string]any, error) {
+	segments := strings.Split(token, ".")
+	if len(segments) != 3 {
+		return nil, nil, fmt.Errorf("jwt was malformed, expected 3 parts, found %d", len(segments))
+	}
+	headers, err := jwtSegmentToMap(segments[0])
 	if err != nil {
-		return nil, fmt.Errorf("failed to unmarshal jwt claims: %w", err)
+		return nil, nil, fmt.Errorf("failed to unmarshal jwt headers: %w", err)
 	}
-	decoded := JWTDecoded{
-		Headers: headers,
-		Claims:  claims,
+	if headers[stdHeaderType] != stdTypeJWT {
+		return nil, nil, fmt.Errorf("jwt type of '%s' is not supported", headers["typ"])
 	}
-	for _, v := range validations {
-		if err := v(&decoded); err != nil {
-			return nil, err
-		}
-	}
-	return &decoded, nil
+	return segments, headers, nil
 }
 
 func jwtSegmentToMap(s string) (map[string]any, error) {
@@ -162,12 +197,65 @@ func jwtSegmentToMap(s string) (map[string]any, error) {
 	return m, nil
 }
 
-func verify(secret, payload, signature string) error {
-	expected := sign(secret, payload)
+func verifyHMACSignature(secret, payload, signature string) error {
+	expected := signHMAC(secret, payload)
 	if expected != signature {
-		return fmt.Errorf("signature did not match")
+		return fmt.Errorf("hmac signature did not match")
 	}
 	return nil
+}
+
+func processClaimsAndValidations(claimsSegment string, headers map[string]any, validations []func(*JWTDecoded) error) (*JWTDecoded, error) {
+	claims, err := jwtSegmentToMap(claimsSegment)
+	if err != nil {
+		return nil, fmt.Errorf("failed to unmarshal jwt claims: %w", err)
+	}
+	decoded := JWTDecoded{
+		Headers: headers,
+		Claims:  claims,
+	}
+	for _, v := range validations {
+		/*
+		 * TODO - maybe only give them access to a struct instead of the pointer?
+		 * Do I want to allow them to manipulate the resulting JWT in the "validations" param?
+		 * What are the security considerations of this?
+		 * It's probably fine, but if I allow this, I need to rename "validations" to something better.
+		 */
+		if err := v(&decoded); err != nil {
+			return nil, err
+		}
+	}
+	return &decoded, nil
+}
+
+func VerifyRSA(publicKey *rsa.PublicKey, token string, validations ...func(*JWTDecoded) error) (*JWTDecoded, error) {
+	segments, headers, err := processHeaders(token)
+	if err != nil {
+		return nil, err
+	}
+	if headers[stdHeaderAlg] != stdAlgRS256 {
+		return nil, fmt.Errorf("jwt signature alg of '%s' is not supported", headers["alg"])
+	}
+	if err := verifyRSASignature(publicKey, fmt.Sprintf("%s.%s", segments[0], segments[1]), segments[2]); err != nil {
+		return nil, fmt.Errorf("jwt signature validation failed: %w", err)
+	}
+	return processClaimsAndValidations(segments[1], headers, validations)
+}
+
+func verifyRSASignature(publicKey *rsa.PublicKey, payload, signature string) error {
+	if publicKey == nil {
+		return fmt.Errorf("public key cannot be nil")
+	}
+	payloadHash := sha256.New()
+	_, err := payloadHash.Write([]byte(payload))
+	if err != nil {
+		return err
+	}
+	signatureBytes, err := base64.RawURLEncoding.DecodeString(signature)
+	if err != nil {
+		return err
+	}
+	return rsa.VerifyPKCS1v15(publicKey, crypto.SHA256, payloadHash.Sum(nil), signatureBytes)
 }
 
 func VerifyHeaderEquals(key string, expected any) func(*JWTDecoded) error {

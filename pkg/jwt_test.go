@@ -1,6 +1,8 @@
 package jwt
 
 import (
+	"crypto/rand"
+	"crypto/rsa"
 	"fmt"
 	"strings"
 	"testing"
@@ -392,7 +394,7 @@ func TestVerifyHMAC(t *testing.T) {
 		assert.Nil(t, err)
 		tokenParts := strings.Split(token, ".")
 		newPayload := fmt.Sprintf("%s.garbage", tokenParts[0])
-		newSig := sign(secret, newPayload)
+		newSig := signHMAC(secret, newPayload)
 		decoded, err := VerifyHMAC(secret, fmt.Sprintf("%s.%s", newPayload, newSig))
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "unmarshal")
@@ -520,4 +522,159 @@ func TestVerifyHMAC(t *testing.T) {
 		assert.ErrorIs(t, err, mockErr)
 		assert.Nil(t, decoded)
 	})
+}
+
+func TestSignRSA(t *testing.T) {
+	t.Parallel()
+
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	assert.Nil(t, err)
+
+	t.Run("should produce an empty claim jwt", func(t *testing.T) {
+		token, err := SignRSA(key)
+		assert.Nil(t, err)
+		assert.Regexp(t, jwtRegex, token)
+	})
+
+	t.Run("should handle a nil being passed in for the key", func(t *testing.T) {
+		token, err := SignRSA(nil)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "private key")
+		assert.Contains(t, err.Error(), "nil")
+		assert.Equal(t, "", token)
+	})
+
+	t.Run("should return an error when given a custom header that cannot be marshalled", func(t *testing.T) {
+		token, err := SignRSA(key, WithHeader("foo", func() {}))
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "failed to marshal jwt headers")
+		assert.Equal(t, "", token)
+	})
+}
+
+func TestVerifyRSA(t *testing.T) {
+	t.Parallel()
+
+	key1, err := rsa.GenerateKey(rand.Reader, 2048)
+	assert.Nil(t, err)
+	key2, err := rsa.GenerateKey(rand.Reader, 2048)
+	assert.Nil(t, err)
+
+	t.Run("should verify all of the passed in standard claims and succeed if they are correct", func(t *testing.T) {
+		testExp := time.Now().Add(30 * time.Second)
+		testIat := time.Now()
+		testNbf := time.Now()
+		customHeaderKey := "foo"
+		customHeaderVal := "FOO"
+		customClaimKey := "bar"
+		customClaimVal := "BAR"
+		token, err := SignRSA(
+			key1,
+			WithAud(aud),
+			WithIss(iss),
+			WithSub(sub),
+			WithExp(testExp),
+			WithNbf(testNbf),
+			WithHeader(customHeaderKey, customHeaderVal),
+			WithClaim(customClaimKey, customClaimVal),
+			WithIat(testIat),
+			WithJti(jti),
+		)
+		assert.Nil(t, err)
+		decoded, err := VerifyRSA(
+			&key1.PublicKey,
+			token,
+			VerifyAud(aud),
+			VerifyIss(iss),
+			VerifySub(sub),
+			VerifyExp(5*time.Second),
+			VerifyNbf(5*time.Second),
+			VerifyHeaderEquals(customHeaderKey, customHeaderVal),
+			VerifyClaimEquals(customClaimKey, customClaimVal),
+		)
+		assert.Nil(t, err)
+		assert.NotNil(t, decoded)
+		assert.Equal(t, "RS256", decoded.GetAlg())
+		assert.Equal(t, "JWT", decoded.GetType())
+		assert.Equal(t, aud, decoded.GetAud())
+		assert.Equal(t, iss, decoded.GetIss())
+		assert.Equal(t, sub, decoded.GetSub())
+		assert.Equal(t, testExp.Unix(), decoded.GetExp())
+		assert.Equal(t, testNbf.Unix(), decoded.GetNbf())
+		assert.Equal(t, customHeaderVal, decoded.Headers[customHeaderKey])
+		assert.Equal(t, customClaimVal, decoded.Claims[customClaimKey])
+		assert.Equal(t, testIat.Unix(), decoded.GetIat())
+		assert.Equal(t, jti, decoded.GetJti())
+	})
+
+	t.Run("should handle malformed headers", func(t *testing.T) {
+		token, err := SignRSA(key1)
+		assert.Nil(t, err)
+		tokenParts := strings.Split(token, ".")
+		decoded, err := VerifyRSA(&key1.PublicKey, fmt.Sprintf("garbage.%s.%s", tokenParts[1], tokenParts[2]))
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "unmarshal")
+		assert.Contains(t, err.Error(), "headers")
+		assert.Nil(t, decoded)
+	})
+
+	t.Run("should handle invalid signature", func(t *testing.T) {
+		token, err := SignRSA(key1)
+		assert.Nil(t, err)
+		tokenParts := strings.Split(token, ".")
+		decoded, err := VerifyRSA(&key1.PublicKey, fmt.Sprintf("%s.%s.garbage", tokenParts[0], tokenParts[1]))
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "validation")
+		assert.Contains(t, err.Error(), "signature")
+		assert.Nil(t, decoded)
+	})
+
+	t.Run("should handle wrong key", func(t *testing.T) {
+		token, err := SignRSA(key2)
+		assert.Nil(t, err)
+		decoded, err := VerifyRSA(&key1.PublicKey, token)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "validation")
+		assert.Contains(t, err.Error(), "signature")
+		assert.Nil(t, decoded)
+	})
+
+	t.Run("should handle a nil being passed in for the key", func(t *testing.T) {
+		token, err := SignRSA(key2)
+		assert.Nil(t, err)
+		decoded, err := VerifyRSA(nil, token)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "public key")
+		assert.Contains(t, err.Error(), "nil")
+		assert.Nil(t, decoded)
+	})
+
+	t.Run("should reject unsupported algorithms", func(t *testing.T) {
+		inputs := []string{
+			"none",
+			"HS256",
+			"HS384",
+			"HS512",
+			// RS256 - supported
+			"RS384",
+			"RS512",
+			"ES256",
+			"ES384",
+			"ES512",
+			"PS256",
+			"PS384",
+			"PS512",
+		}
+		for _, input := range inputs {
+			token, err := SignRSA(key1, WithHeader("alg", input))
+			assert.Nil(t, err)
+			decoded, err := VerifyRSA(&key1.PublicKey, token)
+			assert.Error(t, err)
+			assert.Contains(t, err.Error(), "alg")
+			assert.Contains(t, err.Error(), "signature")
+			assert.Contains(t, err.Error(), "not supported")
+			assert.Nil(t, decoded)
+		}
+	})
+
 }
