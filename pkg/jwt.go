@@ -171,9 +171,13 @@ func VerifyHMAC(secret, token string, validations ...func(*JWTDecoded) error) (*
 }
 
 func processHeaders(token string) ([]string, map[string]any, error) {
+	if count := strings.Count(token, "."); count != 2 {
+		return nil, nil, fmt.Errorf("jwt was malformed, expected 2 '.'s, found %d", count)
+	}
 	segments := strings.Split(token, ".")
 	if len(segments) != 3 {
-		return nil, nil, fmt.Errorf("jwt was malformed, expected 3 parts, found %d", len(segments))
+		// This should be unreachable
+		return nil, nil, fmt.Errorf("DEVELOPER ERROR: jwt was malformed, expected 3 parts, found %d", len(segments))
 	}
 	headers, err := jwtSegmentToMap(segments[0])
 	if err != nil {
